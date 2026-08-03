@@ -1,3 +1,15 @@
+> [!IMPORTANT]
+> ## 🚀 [Newer Versions of Alpamayo Are Available](https://github.com/NVlabs/alpamayo-recipes)
+>
+>
+> This repository is no longer under active development and will receive only limited maintenance updates. Future model releases, features, documentation, and community support will be focused on newer Alpamayo versions.
+>
+> 👉 Visit the new Alpamayo hub: https://github.com/NVlabs/alpamayo-recipes
+>
+> There you will find the latest Alpamayo models, technical reports, tutorials, benchmarks, and ecosystem updates.
+>
+> Thank you for your support of Alpamayo 1. We encourage all users to migrate to newer versions for the latest state-of-the-art Physical AI capabilities.
+
 <div align="center">
 
 # 🏔️ Alpamayo 1
