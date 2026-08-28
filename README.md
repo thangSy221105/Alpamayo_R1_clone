@@ -64,9 +64,16 @@ export PATH="$HOME/.local/bin:$PATH"
 ### 2. Set up the environment
 
 ```bash
-uv venv ar1_venv
-source ar1_venv/bin/activate
+conda create -n ar1 python=3.12 -y
+conda activate ar1
 uv sync --active
+```
+
+`uv sync --active` creates the project environment at `.venv` and installs the
+locked project dependencies. Activate it before running the scripts:
+
+```bash
+source .venv/bin/activate
 ```
 
 ### 3. Authenticate with HuggingFace
@@ -105,6 +112,182 @@ the `num_traj_samples=1` argument to a higher number (Line 60).
 ### Interactive notebook
 
 We provide a notebook with similar inference code at `notebook/inference.ipynb`.
+
+## This Clone: Local Changes
+
+This repository is based on the NVIDIA Alpamayo 1 release and adds research
+utilities for studying the relationship between Chain-of-Causation reasoning
+and trajectory actions.
+
+### Code changes
+
+| File | Change |
+| ---- | ------ |
+| `src/alpamayo_r1/helper.py` | Supports injecting a forced reasoning trace into the VLM prompt. |
+| `src/alpamayo_r1/models/alpamayo_r1.py` | Adds forced-reasoning trajectory sampling and returns the normalized unicycle controls used for intervention. |
+| `src/alpamayo_r1/test_inference.py` | Keeps the original inference example and exposes trajectory/action information for inspection. |
+| `src/alpamayo_r1/evaluate_reasoning_action.py` | Evaluates whether a predicted trajectory is consistent with a reasoning trace using an OpenAI-compatible language-model judge. It also reports timed waypoints and kinematic evidence. |
+| `src/alpamayo_r1/evaluate_reasoning_intervention.py` | Runs paired reasoning interventions, saves full actions/waypoints, supports resume, and writes per-clip progress logs and a final summary. |
+
+The intervention evaluator compares a clean action `u1` with a perturbed action
+`u2` and applies:
+
+```text
+u_new = u1 + alpha * (u1 - u2)
+```
+
+For Alpamayo, each control contains acceleration and curvature over 64 time
+steps. The evaluator supports `no_reasoning`, `noisy`, `cross_scene`, and
+`opposite_action` modes. The current intervention benchmark is a sensitivity
+test; it does not prove that a changed trajectory is safer or closer to the
+ground truth.
+
+### Setup used for the clone
+
+The following setup was tested on Linux with an RTX 3090 and Python 3.12:
+
+```bash
+conda create -n ar1 python=3.12 -y
+conda activate ar1
+uv sync --active
+```
+
+If `uv sync --active` fails while building `flash-attn` because `nvcc` is not
+available, use PyTorch SDPA instead:
+
+```bash
+sed -i '/"flash-attn>=2.8.3",/d' pyproject.toml
+sed -i 's/attn_implementation: str = "flash_attention_2"/attn_implementation: str = "sdpa"/' \
+  src/alpamayo_r1/models/base_model.py
+uv sync --active
+```
+
+For the editable local package used by the evaluation scripts:
+
+```bash
+uv pip install --python .venv/bin/python -e .
+source .venv/bin/activate
+```
+
+Authenticate before downloading gated model/data resources:
+
+```bash
+uv pip install --python .venv/bin/python -U huggingface_hub
+hf auth login
+```
+
+### Basic inference
+
+```bash
+python src/alpamayo_r1/test_inference.py
+```
+
+The released model requires access to `nvidia/Alpamayo-R1-10B` and the
+Physical AI AV dataset. The first run downloads several large model shards.
+
+## Reasoning-Action Evaluation
+
+### Original reasoning-action evaluation
+
+Create a text file with one clip ID per line, then run:
+
+```bash
+python src/alpamayo_r1/evaluate_reasoning_action.py \
+  --clip-ids-file test_clip_ids.txt \
+  --output reasoning_action_eval.jsonl \
+  --lm-model gpt-5.6-luna \
+  --base-url https://api.xah.io/v1
+```
+
+The API key is requested interactively and is not stored in the output files.
+The judge receives the reasoning and the predicted timed trajectory. This
+evaluation does not use a ground-truth trajectory; it measures reasoning-action
+alignment only.
+
+### Intervention benchmark
+
+For a 300-clip fixed-alpha baseline:
+
+```bash
+python src/alpamayo_r1/evaluate_reasoning_intervention.py \
+  --clip-ids-file test_clip_ids_300.txt \
+  --output reasoning_intervention_300_waypoints.jsonl \
+  --modes no_reasoning noisy cross_scene opposite_action \
+  --noisy-strategy lm_conflict \
+  --noisy-model gpt-5.6-luna \
+  --alphas 0 0.5 1.0 2.0 \
+  --lm-model gpt-5.6-luna \
+  --base-url https://api.xah.io/v1
+```
+
+The expected maximum is:
+
+```text
+300 clips × 4 modes × 4 alpha values = 4,800 records
+```
+
+`alpha=0` is the clean-action baseline. The evaluator writes each completed
+record immediately to JSONL, so an interrupted run can be resumed by rerunning
+the same command. Do not use `--overwrite` when resuming. Clean reasoning
+traces are cached in:
+
+```text
+<output_stem>_reasonings.jsonl
+```
+
+LM-generated noisy traces are cached separately in:
+
+```text
+<output_stem>_noisy_reasonings.jsonl
+```
+
+The final summary is written only after all requested records finish. Each
+record contains the clean/perturbed/guided control summaries, raw normalized
+controls, 64 timed waypoints, guidance changes, saturation statistics, and the
+LM judge result.
+
+### Intervention modes
+
+| Mode | Description |
+| ---- | ----------- |
+| `no_reasoning` | Runs the perturbed branch without a reasoning trace. |
+| `noisy` | Uses a contradictory reasoning trace generated by the selected noise strategy. |
+| `cross_scene` | Uses the reasoning trace from another clip; at least two clip IDs are required. |
+| `opposite_action` | Appends an explicit contradictory action to the clean reasoning. |
+
+For LM-generated noise, the same API key and compatible endpoint can be used
+for both noise generation and judging. For a cheaper deterministic test, use:
+
+```bash
+--noisy-strategy heuristic_conflict
+```
+
+### Inspecting one clip
+
+```bash
+python - <<'PY'
+import json
+
+clip_id = "YOUR-CLIP-ID"
+path = "reasoning_intervention_300_waypoints.jsonl"
+
+with open(path, encoding="utf-8") as f:
+    for line in f:
+        record = json.loads(line)
+        if record.get("clip_id") != clip_id:
+            continue
+        judge = record.get("lm_judgement_guided_action", {})
+        print(record["mode"], record["alpha"])
+        print("clean:", record.get("clean_reasoning"))
+        print("perturbed:", record.get("perturbed_reasoning"))
+        print("score:", judge.get("consistency_score"))
+        print("label:", judge.get("label"))
+        print("evidence:", judge.get("trajectory_evidence"))
+PY
+```
+
+Use `lm_judgement_guided_action.consistency_score` for the per-record score.
+The score is a language-model assessment, not a driving-safety guarantee.
 
 ## Relationship with the Paper
 
