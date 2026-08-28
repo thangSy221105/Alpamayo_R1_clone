@@ -326,8 +326,114 @@ class AlpamayoR1(ReasoningVLA):
                 extra[text_tokens] = np.array(extra[text_tokens]).reshape(
                     [input_ids.shape[0], num_traj_sets, num_traj_samples]
                 )
+            if kwargs.get("return_action", False):
+                sampled_action = einops.rearrange(
+                    sampled_action,
+                    "(b ns nj) ... -> b ns nj ...",
+                    ns=num_traj_sets,
+                    nj=num_traj_samples,
+                )
+                return pred_xyz, pred_rot, extra, sampled_action
             return pred_xyz, pred_rot, extra
+        if kwargs.get("return_action", False):
+            sampled_action = einops.rearrange(
+                sampled_action,
+                "(b ns nj) ... -> b ns nj ...",
+                ns=num_traj_sets,
+                nj=num_traj_samples,
+            )
+            return pred_xyz, pred_rot, sampled_action
         return pred_xyz, pred_rot
+
+    def sample_trajectory_from_forced_reasoning(
+        self,
+        data: dict[str, Any],
+        diffusion_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode one trajectory from a caller-supplied, already-tokenized CoC.
+
+        This is a controlled intervention API.  ``data['tokenized_data']`` must
+        contain a chat prompt that ends in ``<|traj_future_start|>``; see
+        :func:`alpamayo_r1.helper.create_message` with ``forced_reasoning``.
+        The camera frames and ego history are unchanged, so only the supplied
+        reasoning context differs between paired calls.
+
+        The public model normally obtains a cache by autoregressively generating
+        CoC text.  Here we prefill that same cache with the supplied CoC and run
+        its diffusion action expert.  One trajectory is intentionally supported:
+        the method is designed for paired causal probes, not throughput sampling.
+        """
+        ego_history_xyz = data["ego_history_xyz"]
+        ego_history_rot = data["ego_history_rot"]
+        batch_size, n_traj_group, _, _ = ego_history_xyz.shape
+        if n_traj_group != 1 or batch_size != 1:
+            raise ValueError("Forced-reasoning intervention currently requires batch size 1.")
+
+        tokenized_data = dict(data["tokenized_data"])
+        input_ids = tokenized_data.pop("input_ids")
+        input_ids = self.fuse_traj_tokens(
+            input_ids,
+            {
+                "ego_history_xyz": ego_history_xyz,
+                "ego_history_rot": ego_history_rot,
+            },
+        )
+        device = input_ids.device
+
+        # Prefill the VLM cache with the exact reasoning trace supplied by the
+        # intervention prompt.  The final token is <|traj_future_start|>, the
+        # same action-expert handoff token used in ordinary VLM generation.
+        vlm_outputs = self.vlm(input_ids=input_ids, use_cache=True, **tokenized_data)
+        prompt_cache = vlm_outputs.past_key_values
+        prefill_seq_len = prompt_cache.get_seq_length()
+        rope_deltas = self.vlm.model.rope_deltas
+        if rope_deltas is None:
+            raise RuntimeError("VLM did not produce rope_deltas during forced-reasoning prefill.")
+
+        n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
+        offset = torch.full((batch_size,), input_ids.shape[1], device=device, dtype=torch.long)
+        position_ids = torch.arange(n_diffusion_tokens, device=device)
+        position_ids = einops.repeat(position_ids, "l -> 3 b l", b=batch_size).clone()
+        position_ids += (rope_deltas + offset[:, None]).to(position_ids.device)
+
+        attention_mask = torch.zeros(
+            (batch_size, 1, n_diffusion_tokens, prefill_seq_len + n_diffusion_tokens),
+            dtype=torch.float32,
+            device=device,
+        )
+        forward_kwargs: dict[str, Any] = {}
+        if self.config.expert_non_causal_attention:
+            forward_kwargs["is_causal"] = False
+
+        def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            future_token_embeds = self.action_in_proj(x, t)
+            if future_token_embeds.dim() == 2:
+                future_token_embeds = future_token_embeds.view(batch_size, n_diffusion_tokens, -1)
+            expert_out = self.expert(
+                inputs_embeds=future_token_embeds,
+                position_ids=position_ids,
+                past_key_values=prompt_cache,
+                attention_mask=attention_mask,
+                use_cache=True,
+                **forward_kwargs,
+            )
+            prompt_cache.crop(prefill_seq_len)
+            hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
+            return self.action_out_proj(hidden).view(-1, *self.action_space.get_action_space_dims())
+
+        sampled_action = self.diffusion.sample(
+            batch_size=batch_size,
+            step_fn=step_fn,
+            device=device,
+            return_all_steps=False,
+            **(diffusion_kwargs or {}),
+        )
+        history_xyz = ego_history_xyz[:, -1]
+        history_rot = ego_history_rot[:, -1]
+        pred_xyz, pred_rot = self.action_space.action_to_traj(
+            sampled_action, history_xyz, history_rot
+        )
+        return pred_xyz, pred_rot, sampled_action
 
 
 AutoConfig.register("alpamayo_r1", AlpamayoR1Config)

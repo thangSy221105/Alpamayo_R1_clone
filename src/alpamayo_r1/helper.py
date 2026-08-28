@@ -25,8 +25,13 @@ MAX_PIXELS = 196608
 BASE_PROCESSOR_NAME = "Qwen/Qwen3-VL-2B-Instruct"
 
 
-def create_message(frames: torch.Tensor):
-    """Construct the message using images and cot."""
+def create_message(frames: torch.Tensor, forced_reasoning: str | None = None):
+    """Construct an inference message, optionally forcing a finished CoC trace.
+
+    ``forced_reasoning`` is intended for controlled intervention experiments only.
+    The normal inference path leaves it as ``None`` and lets the VLM generate the
+    CoC autoregressively.
+    """
     if frames.ndim != 4:
         raise ValueError(f"{frames.ndim=}, expected 4 (N, C, H, W)")
 
@@ -35,6 +40,10 @@ def create_message(frames: torch.Tensor):
     hist_traj_placeholder = (
         f"<|traj_history_start|>{'<|traj_history|>' * num_traj_token}<|traj_history_end|>"
     )
+
+    assistant_prefix = "<|cot_start|>"
+    if forced_reasoning is not None:
+        assistant_prefix += f"{forced_reasoning}<|cot_end|><|traj_future_start|>"
 
     return [
         {
@@ -61,7 +70,7 @@ def create_message(frames: torch.Tensor):
             "content": [
                 {
                     "type": "text",
-                    "text": "<|cot_start|>",
+                    "text": assistant_prefix,
                 }
             ],
         },

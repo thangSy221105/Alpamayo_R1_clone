@@ -19,6 +19,10 @@
 
 import torch
 import numpy as np
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 from alpamayo_r1.load_physical_aiavdataset import load_physical_aiavdataset
@@ -70,6 +74,30 @@ pred_xy = pred_xyz.cpu().numpy()[0, 0, :, :, :2].transpose(0, 2, 1)
 diff = np.linalg.norm(pred_xy - gt_xy[None, ...], axis=1).mean(-1)
 min_ade = diff.min()
 print("minADE:", min_ade, "meters")
+
+# Save a visual comparison of the predicted and ground-truth BEV trajectories.
+plt.figure(figsize=(8, 6))
+plt.plot(gt_xy[0], gt_xy[1], "k-o", markersize=3, label="Ground Truth")
+for i in range(pred_xy.shape[0]):
+    plt.plot(
+        pred_xy[i, 0],
+        pred_xy[i, 1],
+        "--o",
+        markersize=3,
+        label="Prediction" if i == 0 else None,
+    )
+plt.scatter(gt_xy[0, 0], gt_xy[1, 0], c="blue", s=80, label="Start")
+plt.axis("equal")
+plt.xlabel("X (m)")
+plt.ylabel("Y (m)")
+plt.title(f"Trajectory Comparison - minADE: {min_ade:.3f} m")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.savefig("trajectory_comparison.png", dpi=200)
+plt.close()
+print("Saved trajectory plot to trajectory_comparison.png")
+
 print(
     "Note: VLA-reasoning models produce nondeterministic outputs due to trajectory sampling, "
     "hardware differences, etc. With num_traj_samples=1 (set for GPU memory compatibility), "
