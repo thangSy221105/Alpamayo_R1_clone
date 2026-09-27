@@ -186,9 +186,61 @@ def load_reasoning_cache(path: Path) -> dict[str, str]:
     return cached
 
 
-def append_reasoning_cache(path: Path, clip_id: str, reasoning: str) -> None:
+def load_action_token_cache(path: Path) -> dict[str, dict[str, Any]]:
+    """Load action-token metadata saved with normal CoC rollouts."""
+    cached: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return cached
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+            action_token_ids = record.get("action_token_ids")
+            if isinstance(action_token_ids, list):
+                cached[str(record["clip_id"])] = {
+                    "action_token": str(record.get("action_token", "")),
+                    "action_token_ids": [int(value) for value in action_token_ids],
+                    "action_token_type": str(record.get("action_token_type", "unknown")),
+                    "vlm_generated_token_ids": [
+                        int(value) for value in record.get("vlm_generated_token_ids", [])
+                    ],
+                    "vlm_generated_tokens": [
+                        str(value) for value in record.get("vlm_generated_tokens", [])
+                    ],
+                    "vlm_generated_text": str(record.get("vlm_generated_text", "")),
+                }
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+    return cached
+
+
+def append_reasoning_cache(
+    path: Path,
+    clip_id: str,
+    reasoning: str,
+    action_token: str,
+    action_token_ids: list[int],
+    action_token_type: str,
+    vlm_generated_token_ids: list[int],
+    vlm_generated_tokens: list[str],
+    vlm_generated_text: str,
+) -> None:
     with path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps({"clip_id": clip_id, "reasoning": reasoning}, ensure_ascii=False) + "\n")
+        file.write(
+            json.dumps(
+                {
+                    "clip_id": clip_id,
+                    "reasoning": reasoning,
+                    "action_token": action_token,
+                    "action_token_ids": action_token_ids,
+                    "action_token_type": action_token_type,
+                    "vlm_generated_token_ids": vlm_generated_token_ids,
+                    "vlm_generated_tokens": vlm_generated_tokens,
+                    "vlm_generated_text": vlm_generated_text,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
 
 
 def load_noisy_cache(path: Path) -> dict[str, dict[str, str]]:
@@ -347,6 +399,28 @@ def build_perturbation(
     raise ValueError(f"Unsupported mode: {mode}")
 
 
+def extract_action_token_info(
+    generated_token_ids: Any,
+    tokenizer: Any,
+    meta_action_text: str,
+) -> tuple[str, list[int], str]:
+    """Extract semantic meta-action tokens, or the trajectory handoff token."""
+    token_ids = [int(value) for value in np.asarray(generated_token_ids).reshape(-1).tolist()]
+    meta_start = tokenizer.convert_tokens_to_ids("<|meta_action_start|>")
+    meta_end = tokenizer.convert_tokens_to_ids("<|meta_action_end|>")
+    traj_start = tokenizer.convert_tokens_to_ids("<|traj_future_start|>")
+
+    if meta_start in token_ids:
+        start_index = token_ids.index(meta_start) + 1
+        end_index = token_ids.index(meta_end, start_index) if meta_end in token_ids[start_index:] else len(token_ids)
+        return meta_action_text if meta_action_text not in {"['']", "[]"} else "", token_ids[start_index:end_index], "meta_action"
+
+    if traj_start in token_ids:
+        return "", [traj_start], "traj_future_start_handoff"
+
+    return "", [], "none"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--clip-ids-file", default=None)
@@ -383,7 +457,12 @@ def main() -> None:
     parser.add_argument(
         "--skip-lm",
         action="store_true",
-        help="Only run numerical intervention metrics; do not call the LM judge.",
+        help="Disable all external LM calls, including noise generation and judging.",
+    )
+    parser.add_argument(
+        "--skip-lm-judge",
+        action="store_true",
+        help="Skip LM trajectory judging while keeping LM-based noise generation enabled.",
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -396,8 +475,11 @@ def main() -> None:
     if args.noisy_strategy == "lm_conflict" and args.skip_lm:
         raise ValueError("lm_conflict requires an LM client; remove --skip-lm.")
 
+    need_lm_for_noise = "noisy" in args.modes and args.noisy_strategy == "lm_conflict"
+    need_lm_for_judge = not args.skip_lm and not args.skip_lm_judge
+
     lm_client = None
-    if not args.skip_lm:
+    if need_lm_for_noise or need_lm_for_judge:
         try:
             from openai import OpenAI
         except ImportError as exc:
@@ -431,8 +513,13 @@ def main() -> None:
     # First obtain and persist one normal CoC per clip.  This pass makes an
     # actual different-scene rationale available for every cross_scene pair.
     reasonings = load_reasoning_cache(reasoning_path)
+    action_tokens = load_action_token_cache(reasoning_path)
     noisy_cache = load_noisy_cache(noisy_path)
-    missing = [clip_id for clip_id in clip_ids if clip_id not in reasonings]
+    missing = [
+        clip_id
+        for clip_id in clip_ids
+        if clip_id not in reasonings or clip_id not in action_tokens
+    ]
     print(f"Generating/resuming {len(missing)} normal reasoning trace(s)...")
     for index, clip_id in enumerate(missing, start=1):
         print(f"[reasoning {index}/{len(missing)}] {clip_id}")
@@ -447,10 +534,46 @@ def main() -> None:
                 num_traj_samples=1,
                 max_generation_length=256,
                 return_extra=True,
+                return_vlm_token_ids=True,
             )
         reasoning = as_reasoning(extra["cot"][0])
+        meta_action_text = as_reasoning(extra.get("meta_action", [""])[0])
+        vlm_generated_token_ids = [
+            int(value)
+            for value in np.asarray(extra["vlm_generated_token_ids"][0][0][0])
+            .reshape(-1)
+            .tolist()
+        ]
+        vlm_generated_tokens = model.tokenizer.convert_ids_to_tokens(vlm_generated_token_ids)
+        vlm_generated_text = model.tokenizer.decode(
+            vlm_generated_token_ids,
+            skip_special_tokens=False,
+        )
+        action_token, action_token_ids, action_token_type = extract_action_token_info(
+            vlm_generated_token_ids,
+            model.tokenizer,
+            meta_action_text,
+        )
         reasonings[clip_id] = reasoning
-        append_reasoning_cache(reasoning_path, clip_id, reasoning)
+        action_tokens[clip_id] = {
+            "action_token": action_token,
+            "action_token_ids": action_token_ids,
+            "action_token_type": action_token_type,
+            "vlm_generated_token_ids": vlm_generated_token_ids,
+            "vlm_generated_tokens": vlm_generated_tokens,
+            "vlm_generated_text": vlm_generated_text,
+        }
+        append_reasoning_cache(
+            reasoning_path,
+            clip_id,
+            reasoning,
+            action_token,
+            action_token_ids,
+            action_token_type,
+            vlm_generated_token_ids,
+            vlm_generated_tokens,
+            vlm_generated_text,
+        )
 
     completed = existing_keys(output_path, args.overwrite)
     total = len(clip_ids) * len(args.modes) * len(args.alphas)
@@ -464,11 +587,24 @@ def main() -> None:
             }
             if clip_expected_keys.issubset(completed):
                 print(f"[clip {clip_index + 1}/{len(clip_ids)}] {clip_id} (already complete; skip)")
+                print(
+                    f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+                    f"CLIP_DONE clip_index={clip_index + 1}/{len(clip_ids)} "
+                    f"clip={clip_id} new_records=0/{len(clip_expected_keys)} "
+                    f"status=already_complete",
+                    flush=True,
+                )
                 continue
             print(f"[clip {clip_index + 1}/{len(clip_ids)}] {clip_id}")
             clip_started = time.perf_counter()
+            clip_new_records = 0
+            clip_lm_scores: list[float] = []
             data = load_physical_aiavdataset(clip_id, t0_us=args.t0_us, avdi=avdi)
             clean_reasoning = reasonings[clip_id]
+            clean_action_token_info = action_tokens.get(
+                clip_id,
+                {"action_token": "", "action_token_ids": [], "action_token_type": "none"},
+            )
             alternate_id = clip_ids[(clip_index + 1) % len(clip_ids)]
             cross_reasoning = reasonings.get(alternate_id)
             noise_metadata: dict[str, str] | None = None
@@ -550,7 +686,7 @@ def main() -> None:
                         )
                     guided_xy = guided_xyz.detach().cpu().numpy()[0, :, :2]
                     lm_judgement = None
-                    if lm_client is not None:
+                    if lm_client is not None and not args.skip_lm and not args.skip_lm_judge:
                         if alpha == 0.0:
                             # alpha=0 always produces u_new=u1, independently
                             # of the perturbation mode.  Reuse one LM judgement
@@ -587,6 +723,18 @@ def main() -> None:
                             noise_metadata["primary_action"] if mode == "noisy" and noise_metadata else None
                         ),
                         "clean_reasoning": clean_reasoning,
+                        "clean_action_token": clean_action_token_info["action_token"],
+                        "clean_action_token_ids": clean_action_token_info["action_token_ids"],
+                        "action_token_type": clean_action_token_info["action_token_type"],
+                        "clean_vlm_generated_token_ids": clean_action_token_info[
+                            "vlm_generated_token_ids"
+                        ],
+                        "clean_vlm_generated_tokens": clean_action_token_info[
+                            "vlm_generated_tokens"
+                        ],
+                        "clean_vlm_generated_text": clean_action_token_info[
+                            "vlm_generated_text"
+                        ],
                         "perturbed_reasoning": perturbed_reasoning,
                         "cross_scene_source_clip_id": alternate_id if mode == "cross_scene" else None,
                         "formula": "u_new = u1 + alpha * (u1 - u2), with physical a/kappa clipping",
@@ -622,11 +770,14 @@ def main() -> None:
                     output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
                     output_file.flush()
                     completed.add(key)
+                    clip_new_records += 1
                     lm_score = (
                         lm_judgement["consistency_score"]
                         if lm_judgement is not None
                         else None
                     )
+                    if lm_score is not None:
+                        clip_lm_scores.append(float(lm_score))
                     lm_label = (
                         lm_judgement["label"] if lm_judgement is not None else None
                     )
@@ -637,6 +788,22 @@ def main() -> None:
                         f"clip_elapsed_s={time.perf_counter() - clip_started:.1f}",
                         flush=True,
                     )
+
+            clip_done_scores = (
+                f"lm_score_mean={sum(clip_lm_scores) / len(clip_lm_scores):.3f} "
+                f"lm_score_min={min(clip_lm_scores):.3f} "
+                f"lm_score_max={max(clip_lm_scores):.3f}"
+                if clip_lm_scores
+                else "lm_score_mean=None lm_score_min=None lm_score_max=None"
+            )
+            print(
+                f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+                f"CLIP_DONE clip_index={clip_index + 1}/{len(clip_ids)} "
+                f"clip={clip_id} new_records={clip_new_records}/{len(clip_expected_keys)} "
+                f"{clip_done_scores} "
+                f"clip_elapsed_s={time.perf_counter() - clip_started:.1f}",
+                flush=True,
+            )
 
     records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line]
     by_mode_alpha: dict[str, dict[str, list[dict[str, Any]]]] = {}

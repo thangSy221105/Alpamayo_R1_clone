@@ -326,6 +326,18 @@ class AlpamayoR1(ReasoningVLA):
                 extra[text_tokens] = np.array(extra[text_tokens]).reshape(
                     [input_ids.shape[0], num_traj_sets, num_traj_samples]
                 )
+            if kwargs.get("return_vlm_token_ids", False):
+                prompt_length = input_ids.shape[1]
+                generated_token_ids = vlm_outputs.sequences[:, prompt_length:]
+                generated_token_ids = einops.rearrange(
+                    generated_token_ids,
+                    "(b ns nj) l -> b ns nj l",
+                    ns=num_traj_sets,
+                    nj=num_traj_samples,
+                )
+                extra["vlm_generated_token_ids"] = (
+                    generated_token_ids.detach().cpu().numpy()
+                )
             if kwargs.get("return_action", False):
                 sampled_action = einops.rearrange(
                     sampled_action,

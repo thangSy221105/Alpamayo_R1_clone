@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import math
 import pickle
-import warnings
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
+# NAVSIM has no optical front-tele camera. The crop remains available as an
+# explicit option, while the default fourth view is CAM_L1.
+PSEUDO_TELE_CAMERA_NAME = "CAM_F0_TELE_CROP"
+# Center on the NAVSIM camera optical axis; double the 558x314 crop dimensions.
+PSEUDO_TELE_NAVSIM_ROI = (0.209375, 0.2093, 0.790625, 0.7907)
 DEFAULT_CAMERA_NAMES = ("CAM_L0", "CAM_F0", "CAM_R0", "CAM_L1")
 IMAGE_HISTORY_OFFSETS_S = (-1.5, -1.0, -0.5, 0.0)
 AR1_HISTORY_STEPS = 16
@@ -147,9 +151,141 @@ def _resolve_sensor_path(
     return candidate
 
 
+def _source_camera_name(camera_name: str) -> str:
+    """Resolve derived camera views to their underlying NAVSIM sensor."""
+    if camera_name == PSEUDO_TELE_CAMERA_NAME:
+        return "CAM_F0"
+    return camera_name
+
+
+def _pseudo_tele_crop_bounds(width: int, height: int) -> tuple[int, int, int, int]:
+    """Return an optical-axis-centered CAM_F0 crop with source aspect ratio."""
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Image dimensions must be positive, got {(width, height)}")
+
+    x0_rel, y0_rel, x1_rel, y1_rel = PSEUDO_TELE_NAVSIM_ROI
+    center_x = (x0_rel + x1_rel) / 2.0
+    center_y = (y0_rel + y1_rel) / 2.0
+    crop_width = min(width, max(1, int(round((x1_rel - x0_rel) * width))))
+    # Keep the crop's pixel aspect equal to the source image; do not stretch it.
+    crop_height = min(height, max(1, int(round(crop_width * height / width))))
+    x0 = int(round(center_x * width - crop_width / 2.0))
+    y0 = int(round(center_y * height - crop_height / 2.0))
+    x0 = min(width - crop_width, max(0, x0))
+    y0 = min(height - crop_height, max(0, y0))
+    return x0, y0, crop_width, crop_height
+
+
+def _make_pseudo_tele_view(rgb: np.ndarray) -> np.ndarray:
+    """Make a digital pseudo-tele view using a centered CAM_F0 region.
+
+    This is a fixed center-region crop, not a calibrated 30-degree camera or
+    an optical telephoto view. It is centered on the optical axis and resized
+    to the model's input shape while preserving the source aspect ratio.
+    """
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError(
+            "OpenCV is required for the CAM_F0 pseudo-tele view; "
+            "install opencv-python-headless in the AR1 environment"
+        ) from exc
+
+    height, width = rgb.shape[:2]
+    x0, y0, crop_width, crop_height = _pseudo_tele_crop_bounds(width, height)
+    crop = rgb[y0 : y0 + crop_height, x0 : x0 + crop_width]
+    if crop.size == 0:
+        raise ValueError("CAM_F0 centered pseudo-tele ROI produced an empty crop")
+    return cv2.resize(crop, (width, height), interpolation=cv2.INTER_CUBIC)
+
+
 def _history_offsets() -> np.ndarray:
     # 16 samples at 10 Hz: -1.5, -1.4, ..., 0.0 seconds.
     return np.linspace(-(AR1_HISTORY_STEPS - 1) * AR1_HISTORY_STEP_S, 0.0, AR1_HISTORY_STEPS)
+
+
+def _select_navsim_window(
+    frames: list[Any],
+    scene_index: int,
+    history_frame_count: int,
+    future_frame_count: int,
+    require_route: bool,
+) -> tuple[int, list[Any], list[Any]]:
+    """Select a NAVSIM SceneFilter-style non-overlapping history/future window.
+
+    NAVSIM's ``frame_interval: null`` means ``num_history_frames +
+    num_future_frames``. Its route filter checks ``roadblock_ids`` on the final
+    history frame (the prediction anchor), then uses the frames after that as
+    ground truth.
+    """
+    if history_frame_count < 2:
+        raise ValueError("NAVSIM split requires at least two history frames")
+    if future_frame_count < 1:
+        raise ValueError("NAVSIM split requires at least one future frame")
+    if scene_index < 0:
+        raise ValueError("scene_index must be non-negative")
+
+    window_size = history_frame_count + future_frame_count
+    valid_windows: list[tuple[int, list[Any]]] = []
+    for start in range(0, len(frames) - window_size + 1, window_size):
+        window = frames[start : start + window_size]
+        if len(window) != window_size:
+            continue
+        if require_route:
+            anchor_frame = window[history_frame_count - 1]
+            route_ids = anchor_frame.get("roadblock_ids") if isinstance(anchor_frame, dict) else None
+            if not isinstance(route_ids, (list, tuple)) or not route_ids:
+                continue
+        valid_windows.append((start, window))
+
+    if scene_index >= len(valid_windows):
+        raise ValueError(
+            "Requested NAVSIM scene window is unavailable: "
+            f"scene_index={scene_index}, eligible_windows={len(valid_windows)}, "
+            f"window_size={window_size}, require_route={require_route}"
+        )
+
+    start, window = valid_windows[scene_index]
+    return start, window[:history_frame_count], window[history_frame_count:]
+
+
+def _select_navsim_window_by_anchor_token(
+    frames: list[Any],
+    anchor_token: str,
+    history_frame_count: int,
+    future_frame_count: int,
+    require_route: bool,
+) -> tuple[int, list[Any], list[Any]]:
+    """Select the exact sliding NAVSIM window named by its official anchor token."""
+    if history_frame_count < 2 or future_frame_count < 1:
+        raise ValueError("NAVSIM token window needs at least two history and one future frame")
+    matches = [
+        index
+        for index, frame in enumerate(frames)
+        if isinstance(frame, dict) and str(frame.get("token")) == anchor_token
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected exactly one NAVSIM anchor token {anchor_token!r}; found {len(matches)}"
+        )
+
+    anchor_index = matches[0]
+    window_start = anchor_index - history_frame_count + 1
+    future_end = anchor_index + future_frame_count + 1
+    if window_start < 0 or future_end > len(frames):
+        raise ValueError(
+            "Official NAVSIM token does not have the configured history/future window: "
+            f"anchor_index={anchor_index}, history={history_frame_count}, "
+            f"future={future_frame_count}, frames={len(frames)}"
+        )
+
+    history = frames[window_start : anchor_index + 1]
+    future = frames[anchor_index + 1 : future_end]
+    if require_route:
+        route_ids = history[-1].get("roadblock_ids") if isinstance(history[-1], dict) else None
+        if not isinstance(route_ids, (list, tuple)) or not route_ids:
+            raise ValueError(f"NAVSIM anchor token {anchor_token!r} has no route")
+    return window_start, history, future
 
 
 def _interpolate_history(
@@ -207,64 +343,172 @@ def _interpolate_history(
 def load_navsim_sample(
     metadata_path: str | Path,
     sensor_root: str | Path,
-    anchor_index: int,
+    anchor_index: int | None = None,
     camera_names: tuple[str, ...] = DEFAULT_CAMERA_NAMES,
     max_image_time_error_s: float = DEFAULT_MAX_IMAGE_TIME_ERROR_S,
     max_pose_gap_s: float = DEFAULT_MAX_POSE_GAP_S,
+    scene_index: int | None = None,
+    history_frame_count: int = 4,
+    future_frame_count: int = 10,
+    require_route: bool = True,
+    metadata_frames: list[Any] | None = None,
+    anchor_token: str | None = None,
 ) -> dict[str, Any]:
-    """Load one NAVSIM anchor using historical poses and images only.
+    """Load NAVSIM history for inference and keep its future as separate GT.
 
     Returned arrays are NumPy arrays so this adapter can be tested without
-    importing the model stack. The smoke runner converts them to torch tensors.
-    NAVSIM pose quaternions are scalar-first ``[w, x, y, z]``.
+    importing the model stack. The smoke runner converts history arrays to
+    torch tensors. ``scene_index`` selects the legacy non-overlapping window;
+    ``anchor_token`` selects an exact official NAVSIM-filter token using a
+    sliding window (the NAVSIM v1.1 navtest protocol). ``anchor_index`` remains
+    available for isolated adapter tests and backward compatibility.
+
+    NAVSIM pose quaternions are scalar-first ``[w, x, y, z]``. Future frames
+    are transformed to the anchor ego frame and returned only under
+    ``ground_truth_future``; they are never used to construct model inputs.
     """
     if not math.isfinite(max_image_time_error_s) or max_image_time_error_s < 0:
         raise ValueError("max_image_time_error_s must be finite and non-negative")
     if not math.isfinite(max_pose_gap_s) or max_pose_gap_s <= 0:
         raise ValueError("max_pose_gap_s must be finite and positive")
-    if len(camera_names) != 4 or len(set(camera_names)) != 4:
-        raise ValueError(f"Exactly four distinct camera names are required, got {camera_names!r}")
+    if len(camera_names) not in (3, 4) or len(set(camera_names)) != len(camera_names):
+        raise ValueError(
+            "Three or four distinct camera names are required, "
+            f"got {camera_names!r}"
+        )
 
     metadata_path = Path(metadata_path)
     sensor_root = Path(sensor_root)
-    with metadata_path.open("rb") as stream:
-        frames = pickle.load(stream)  # The pickle container is deserialized as a whole.
+    if metadata_frames is None:
+        with metadata_path.open("rb") as stream:
+            frames = pickle.load(stream)  # The pickle container is deserialized as a whole.
+    else:
+        # Batch evaluation can reuse one deserialized metadata sequence across
+        # several non-overlapping windows instead of unpickling it per sample.
+        frames = metadata_frames
     if not isinstance(frames, list) or not frames:
         detail = f"NAVSIM metadata root must be a non-empty list; got {type(frames).__name__}"
         raise ValueError(detail)
-    if not isinstance(anchor_index, int) or anchor_index < 0 or anchor_index >= len(frames):
-        detail = f"anchor_index={anchor_index} outside metadata range [0, {len(frames) - 1}]"
-        raise ValueError(detail)
 
-    # Do not validate or index any future frame fields; only the list length is
-    # used to disclose that the pickle container included later records.
-    history_frames = frames[: anchor_index + 1]
+    navsim_split: dict[str, Any] | None = None
+    ground_truth_frames: list[Any] = []
+    if sum(value is not None for value in (scene_index, anchor_index, anchor_token)) > 1:
+        raise ValueError("Pass only one of scene_index, anchor_index, or anchor_token")
+
+    if anchor_token is not None:
+        window_start, history_frames, ground_truth_frames = _select_navsim_window_by_anchor_token(
+            frames,
+            anchor_token=anchor_token,
+            history_frame_count=history_frame_count,
+            future_frame_count=future_frame_count,
+            require_route=require_route,
+        )
+        anchor_index = window_start + history_frame_count - 1
+        history_source_indices = list(range(window_start, anchor_index + 1))
+        future_source_indices = list(
+            range(anchor_index + 1, anchor_index + 1 + len(ground_truth_frames))
+        )
+        navsim_split = {
+            "protocol": "NAVSIM v1.1 navtest SceneFilter token window",
+            "anchor_token": anchor_token,
+            "prediction_anchor_frame_index": anchor_index,
+            "window_start_frame_index": window_start,
+            "history_frame_count": history_frame_count,
+            "future_frame_count": future_frame_count,
+            "frame_interval": 1,
+            "require_route": require_route,
+            "history_source_frame_indices": history_source_indices,
+            "future_ground_truth_source_frame_indices": future_source_indices,
+        }
+    elif scene_index is not None:
+        if anchor_index is not None:
+            raise ValueError("Pass scene_index or anchor_index, not both")
+        window_start, history_frames, ground_truth_frames = _select_navsim_window(
+            frames,
+            scene_index=scene_index,
+            history_frame_count=history_frame_count,
+            future_frame_count=future_frame_count,
+            require_route=require_route,
+        )
+        anchor_index = window_start + history_frame_count - 1
+        history_source_indices = list(range(window_start, anchor_index + 1))
+        future_source_indices = list(
+            range(anchor_index + 1, anchor_index + 1 + len(ground_truth_frames))
+        )
+        navsim_split = {
+            "protocol": "NAVSIM SceneFilter non-overlapping window",
+            "scene_index": scene_index,
+            "window_index_in_source": window_start // (history_frame_count + future_frame_count),
+            "window_start_frame_index": window_start,
+            "prediction_anchor_frame_index": anchor_index,
+            "history_frame_count": history_frame_count,
+            "future_frame_count": future_frame_count,
+            "frame_interval": history_frame_count + future_frame_count,
+            "require_route": require_route,
+            "route_ids_at_anchor": (
+                list(history_frames[-1].get("roadblock_ids", []))
+                if isinstance(history_frames[-1], dict)
+                else []
+            ),
+            "history_source_frame_indices": history_source_indices,
+            "future_ground_truth_source_frame_indices": future_source_indices,
+        }
+    else:
+        if anchor_index is None or not isinstance(anchor_index, int):
+            raise ValueError("Provide a valid scene_index or anchor_index")
+        if anchor_index < 0 or anchor_index >= len(frames):
+            detail = f"anchor_index={anchor_index} outside metadata range [0, {len(frames) - 1}]"
+            raise ValueError(detail)
+        # Legacy path retained for unit tests; the smoke runner does not use it.
+        history_frames = frames[: anchor_index + 1]
+        history_source_indices = list(range(anchor_index + 1))
+        future_source_indices = []
+
     if len(history_frames) < 2:
         raise ValueError("Insufficient historical frames: at least two poses are required")
 
     timestamps = np.asarray(
-        [_timestamp_us(frame, i) for i, frame in enumerate(history_frames)], dtype=np.int64
+        [
+            _timestamp_us(frame, history_source_indices[i])
+            for i, frame in enumerate(history_frames)
+        ],
+        dtype=np.int64,
     )
     duplicate = np.flatnonzero(np.diff(timestamps) == 0)
     if duplicate.size:
         i = int(duplicate[0] + 1)
         detail = f"duplicate timestamp {int(timestamps[i])} us"
-        raise _fail(i, history_frames[i], "timestamp", detail)
+        raise _fail(history_source_indices[i], history_frames[i], "timestamp", detail)
     decreasing = np.flatnonzero(np.diff(timestamps) < 0)
     if decreasing.size:
         i = int(decreasing[0] + 1)
         detail = f"timestamps are not increasing after frame {i - 1}"
-        raise _fail(i, history_frames[i], "timestamp", detail)
+        raise _fail(history_source_indices[i], history_frames[i], "timestamp", detail)
 
     translations = np.stack(
-        [_vector(frame, i, "ego2global_translation", 3) for i, frame in enumerate(history_frames)]
+        [
+            _vector(frame, history_source_indices[i], "ego2global_translation", 3)
+            for i, frame in enumerate(history_frames)
+        ]
     )
     quaternions = np.stack(
-        [_vector(frame, i, "ego2global_rotation", 4) for i, frame in enumerate(history_frames)]
+        [
+            _vector(frame, history_source_indices[i], "ego2global_rotation", 4)
+            for i, frame in enumerate(history_frames)
+        ]
     )
     anchor = history_frames[-1]
     anchor_timestamp = int(timestamps[-1])
-    history_offsets = _history_offsets()
+    if navsim_split is not None:
+        # NAVSIM poses are nominally 2 Hz but their microsecond timestamps are
+        # not perfectly periodic. Resample the 16 AR1 history points over the
+        # exact observed 4-frame span, avoiding extrapolation by sub-ms jitter.
+        observed_history_start_s = float((timestamps[0] - anchor_timestamp) / 1_000_000.0)
+        history_offsets = np.linspace(
+            observed_history_start_s, 0.0, AR1_HISTORY_STEPS, dtype=np.float64
+        )
+    else:
+        history_offsets = _history_offsets()
     target_timestamps = anchor_timestamp + np.rint(history_offsets * 1_000_000).astype(np.int64)
     if target_timestamps[0] < timestamps[0]:
         raise ValueError(
@@ -285,7 +529,8 @@ def load_navsim_sample(
             right_index = left_index + 1
             raise ValueError(
                 "NAVSIM source pose gap exceeds limit: "
-                f"frames={left_index}->{right_index}, "
+                f"frames={history_source_indices[left_index]}->"
+                f"{history_source_indices[right_index]}, "
                 f"tokens={history_frames[left_index].get('token')!r}->"
                 f"{history_frames[right_index].get('token')!r}, "
                 f"gap={largest_gap_s:.6f}s, limit={max_pose_gap_s:.6f}s"
@@ -316,6 +561,83 @@ def load_navsim_sample(
     ego_xyz[-1] = 0.0
     ego_rot[-1] = np.eye(3, dtype=np.float32)
 
+    ground_truth_future: dict[str, Any] | None = None
+    if ground_truth_frames:
+        future_timestamps = np.asarray(
+            [
+                _timestamp_us(frame, future_source_indices[i])
+                for i, frame in enumerate(ground_truth_frames)
+            ],
+            dtype=np.int64,
+        )
+        combined_timestamps = np.concatenate((timestamps[-1:], future_timestamps))
+        invalid_future_order = np.flatnonzero(np.diff(combined_timestamps) <= 0)
+        if invalid_future_order.size:
+            bad_local_index = int(invalid_future_order[0])
+            bad_source_index = future_source_indices[bad_local_index]
+            raise _fail(
+                bad_source_index,
+                ground_truth_frames[bad_local_index],
+                "timestamp",
+                "future ground-truth timestamps must strictly follow the prediction anchor",
+            )
+        future_gaps = np.diff(combined_timestamps)
+        oversized_future_gap = np.flatnonzero(future_gaps > max_pose_gap_s * 1_000_000)
+        if oversized_future_gap.size:
+            gap_index = int(oversized_future_gap[0])
+            bad_source_index = future_source_indices[gap_index]
+            gap_s = float(future_gaps[gap_index]) / 1_000_000.0
+            raise _fail(
+                bad_source_index,
+                ground_truth_frames[gap_index],
+                "timestamp",
+                f"future frame gap={gap_s:.6f}s exceeds limit={max_pose_gap_s:.6f}s",
+            )
+
+        future_translations = np.stack(
+            [
+                _vector(frame, future_source_indices[i], "ego2global_translation", 3)
+                for i, frame in enumerate(ground_truth_frames)
+            ]
+        )
+        future_quaternions = np.stack(
+            [
+                _vector(frame, future_source_indices[i], "ego2global_rotation", 4)
+                for i, frame in enumerate(ground_truth_frames)
+            ]
+        )
+        try:
+            from scipy.spatial.transform import Rotation
+        except ImportError:  # Match the history transform fallback.
+            anchor_q_inv = anchor_q * np.asarray([1.0, -1.0, -1.0, -1.0])
+            future_xyz_ego = np.stack(
+                [_quat_rotate(anchor_q_inv, p - anchor_xyz) for p in future_translations]
+            )
+            future_ego_quat = np.stack(
+                [_quat_multiply(anchor_q_inv, q) for q in future_quaternions]
+            )
+            future_rot_ego = np.stack(
+                [_quat_to_matrix(q / np.linalg.norm(q)) for q in future_ego_quat]
+            )
+        else:
+            anchor_rotation = Rotation.from_quat(anchor_q[[1, 2, 3, 0]])
+            future_rotations = Rotation.from_quat(future_quaternions[:, [1, 2, 3, 0]])
+            future_xyz_ego = anchor_rotation.inv().apply(future_translations - anchor_xyz)
+            future_rot_ego = (anchor_rotation.inv() * future_rotations).as_matrix()
+
+        ground_truth_future = {
+            "source": "NAVSIM SceneFilter future frames after the history anchor",
+            "used_for_model_input": False,
+            "frame_indices": future_source_indices,
+            "timestamps_us": future_timestamps.tolist(),
+            "time_offsets_s": ((future_timestamps - anchor_timestamp) / 1_000_000.0).tolist(),
+            "ego_xyz": future_xyz_ego.astype(np.float32).tolist(),
+            "ego_heading_rad": np.arctan2(future_rot_ego[:, 1, 0], future_rot_ego[:, 0, 0])
+            .astype(np.float32)
+            .tolist(),
+            "coordinate_frame": "prediction-anchor ego frame; x-forward, y-left, z-up",
+        }
+
     camera_arrays: list[np.ndarray] = []
     image_indices: list[list[int]] = []
     image_timestamps: list[list[int]] = []
@@ -341,46 +663,77 @@ def load_navsim_sample(
                 raise ValueError(
                     "NAVSIM image timing error exceeds limit: "
                     f"camera={camera_name}, target_offset={target_offset:+.3f}s, "
-                    f"selected_frame_index={selected_index}, token={frame.get('token')!r}, "
+                    f"selected_frame_index={history_source_indices[selected_index]}, "
+                    f"token={frame.get('token')!r}, "
                     f"selected_offset="
                     f"{(timestamps[selected_index] - anchor_timestamp) / 1e6:+.6f}s, "
                     f"absolute_error={abs_error_s:.6f}s, limit={max_image_time_error_s:.6f}s"
                 )
+            source_camera_name = _source_camera_name(camera_name)
             cams = frame.get("cams") if isinstance(frame, dict) else None
-            if not isinstance(cams, dict) or camera_name not in cams:
-                raise _fail(selected_index, frame, f"cams.{camera_name}", "camera entry is missing")
-            camera_record = cams[camera_name]
+            if not isinstance(cams, dict) or source_camera_name not in cams:
+                raise _fail(
+                    selected_index,
+                    frame,
+                    f"cams.{source_camera_name}",
+                    "source camera entry is missing",
+                )
+            camera_record = cams[source_camera_name]
             if not isinstance(camera_record, dict):
                 raise _fail(
                     selected_index,
                     frame,
-                    f"cams.{camera_name}",
+                    f"cams.{source_camera_name}",
                     "camera entry must be a mapping",
                 )
             path = _resolve_sensor_path(
-                sensor_root, camera_record.get("data_path"), frame, selected_index, camera_name
+                sensor_root,
+                camera_record.get("data_path"),
+                frame,
+                history_source_indices[selected_index],
+                source_camera_name,
             )
             try:
                 with Image.open(path) as image:
                     rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
             except Exception as exc:
                 detail = f"cannot decode {path}: {exc}"
-                raise _fail(selected_index, frame, f"cams.{camera_name}.data_path", detail) from exc
+                raise _fail(
+                    history_source_indices[selected_index],
+                    frame,
+                    f"cams.{source_camera_name}.data_path",
+                    detail,
+                ) from exc
             if rgb.ndim != 3 or rgb.shape[2] != 3:
                 detail = f"expected RGB HWC image, got {rgb.shape}"
-                raise _fail(selected_index, frame, f"cams.{camera_name}.data_path", detail)
+                raise _fail(
+                    history_source_indices[selected_index],
+                    frame,
+                    f"cams.{camera_name}.data_path",
+                    detail,
+                )
+            if camera_name == PSEUDO_TELE_CAMERA_NAME:
+                try:
+                    rgb = _make_pseudo_tele_view(rgb)
+                except Exception as exc:
+                    raise _fail(
+                        history_source_indices[selected_index],
+                        frame,
+                        f"derived_view.{camera_name}",
+                        str(exc),
+                    ) from exc
             hw = (int(rgb.shape[0]), int(rgb.shape[1]))
             if expected_hw is None:
                 expected_hw = hw
             elif hw != expected_hw:
                 raise _fail(
-                    selected_index,
+                    history_source_indices[selected_index],
                     frame,
-                    f"cams.{camera_name}.data_path",
+                    f"cams.{source_camera_name}.data_path",
                     f"image resolution mismatch: expected HxW={expected_hw}, got {hw} at {path}",
                 )
             camera_images.append(np.ascontiguousarray(rgb.transpose(2, 0, 1)))
-            camera_indices.append(selected_index)
+            camera_indices.append(history_source_indices[selected_index])
             camera_times.append(int(timestamps[selected_index]))
             offset_s = float((timestamps[selected_index] - anchor_timestamp) / 1_000_000.0)
             camera_offsets.append(offset_s)
@@ -393,12 +746,6 @@ def load_navsim_sample(
         image_signed_errors.append(camera_errors)
         image_abs_errors.append(camera_abs_errors)
 
-    if camera_names == DEFAULT_CAMERA_NAMES and camera_names[3] == "CAM_L1":
-        warnings.warn(
-            "Default fourth view CAM_L1 is a left-side camera, not an AR1 front-tele equivalent.",
-            UserWarning,
-            stacklevel=2,
-        )
     image_frames = np.ascontiguousarray(np.stack(camera_arrays, axis=0), dtype=np.uint8)
     gaps_s = np.diff(timestamps).astype(np.float64) / 1_000_000.0
     source_rate_hz = float(1.0 / np.median(gaps_s)) if gaps_s.size else None
@@ -408,6 +755,7 @@ def load_navsim_sample(
         "scene_name": scene_name,
         "log_name": anchor.get("log_name"),
         "anchor_index": anchor_index,
+        "navsim_split": navsim_split,
         "anchor_token": anchor.get("token"),
         "anchor_timestamp_us": anchor_timestamp,
         "camera_names": list(camera_names),
@@ -428,16 +776,23 @@ def load_navsim_sample(
         "source_camera_rate_hz_estimate": source_rate_hz,
         "source_rate_note": (
             "Estimated from median historical frame interval; "
-            "OpenScene mini is nominally about 2 Hz."
+            "OpenScene poses are nominally about 2 Hz."
         ),
         "ar1_reference_camera_rate_hz": AR1_REFERENCE_CAMERA_RATE_HZ,
         # NAVSIM has no camera that is asserted to be the AR1 front-tele view.
         "fourth_camera_equivalent_to_ar1_front_tele": False,
         "camera_mapping_note": (
-            "CAM_L1 is not equivalent to the AR1 front-tele camera."
-            if camera_names[3] == "CAM_L1"
-            else "Camera names are passed as selected; no equivalence is inferred."
+            "Fourth view CAM_F0_TELE_CROP uses the user's manually marked center ROI "
+            "from CAM_F0, expanded vertically to preserve aspect ratio; it is a digital "
+            "pseudo-tele crop, not a calibrated 30-degree or optical tele camera."
+            if PSEUDO_TELE_CAMERA_NAME in camera_names
+            else (
+                "CAM_L1 is a left-side camera, not an asserted AR1 front-tele equivalent."
+                if "CAM_L1" in camera_names
+                else "Camera names are passed as selected; no equivalence is inferred."
+            )
         ),
         "future_frames_deserialized": len(frames) > anchor_index + 1,
         "future_used_for_model_input": False,
+        "ground_truth_future": ground_truth_future,
     }
